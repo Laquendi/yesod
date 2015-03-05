@@ -45,6 +45,8 @@ module Yesod.Auth.Email
     , defaultRegisterHandler
     , defaultForgotPasswordHandler
     , defaultSetPasswordHandler
+    , defaultReRegister
+    , defaultForgotPassword
     ) where
 
 import Network.Mail.Mime (randomString)
@@ -248,6 +250,37 @@ class ( YesodAuth site
       -> AuthHandler site TypedContent
     setPasswordHandler = defaultSetPasswordHandler
 
+    -- | Send an email to the given address to verify ownership after user requests
+    -- password reset.
+    --
+
+    sendForgotPasswordEmail :: Email -> VerKey -> VerUrl -> HandlerT site IO ()
+    sendForgotPasswordEmail = sendVerifyEmail
+
+    -- | Response after sending a password reset email.
+    --
+
+    forgotPasswordEmailSentResponse :: Text -> HandlerT site IO TypedContent
+    forgotPasswordEmailSentResponse = confirmationEmailSentResponse
+
+    -- | What to do when existing user tries to register again.
+    --
+    -- Default: If verKey was used already generate and set a new one. Send verification email again.
+    --
+
+    reRegister :: EmailCreds site -> AuthHandler site TypedContent
+    reRegister = defaultReRegister
+
+    -- | What to do when user requests password reset
+    --
+    -- Default: If verKey was used already generate and set a new verKey for user. 
+    -- Send forgot password email.
+    --
+
+    forgotPassword ::    EmailCreds site
+                      -> Text -- ^ Actual identifier used
+                      -> AuthHandler site TypedContent
+    forgotPassword = defaultForgotPassword
 
 authEmail :: YesodAuthEmail m => AuthPlugin m
 authEmail =
@@ -307,11 +340,63 @@ defaultRegisterHandler = do
                 <button .btn>_{Msg.Register}
         |]
 
+-- | Default implementation of 'defaultReRegister'.
+--
+
+defaultReRegister :: YesodAuthEmail site
+                         => EmailCreds site
+                         -> HandlerT Auth (HandlerT site IO) TypedContent
+defaultReRegister creds = do
+    case creds of
+        EmailCreds _ _ _ (Just _) email -> -- previous key unused
+            sendEmailHelper sendVerifyEmail
+                confirmationEmailSentResponse creds email
+        EmailCreds _ _ _ _ email -> do
+            y <- lift getYesod
+            newKey <- liftIO $ randomKey y
+            lift $ setVerifyKey (emailCredsId creds) newKey
+            sendEmailHelper sendVerifyEmail confirmationEmailSentResponse
+                creds{emailCredsVerkey = Just newKey} email
+
+-- | Default implementation of 'defaultForgotPassword'.
+--
+
+defaultForgotPassword :: YesodAuthEmail site
+                             => EmailCreds site
+                             -> Text -- ^ actual identifier used
+                             -> HandlerT Auth (HandlerT site IO) TypedContent
+defaultForgotPassword creds identifier = do
+    case creds of
+        EmailCreds _ _ _ (Just _) _ -> -- previous key unused
+            sendEmailHelper sendForgotPasswordEmail
+                forgotPasswordEmailSentResponse creds identifier
+        _ -> do
+            y <- lift getYesod
+            newKey <- liftIO $ randomKey y
+            lift $ setVerifyKey (emailCredsId creds) newKey
+            sendEmailHelper sendForgotPasswordEmail
+                forgotPasswordEmailSentResponse creds{emailCredsVerkey = Just newKey} identifier
+
+sendEmailHelper :: YesodAuthEmail master
+                => (Email -> VerKey -> VerUrl -> HandlerT master IO ()) -- ^ email handler
+                -> (Text -> HandlerT master IO TypedContent) -- ^ response handler
+                -> EmailCreds master
+                -> Text -- ^ actual identifier used
+                -> AuthHandler master TypedContent
+sendEmailHelper emailHandler sentResponseHandler
+    (EmailCreds lid _ _ (Just verKey) email) identifier = do
+    render <- getUrlRender
+    let verUrl = render $ verify (toPathPiece lid) verKey
+    lift $ emailHandler email verKey verUrl
+    lift $ sentResponseHandler identifier
+sendEmailHelper _ _ _ _ = error "Can't send verification email without verKey"
+
+data RegisterType = Register | ForgotPassword
+
 registerHelper :: YesodAuthEmail master
-               => Bool -- ^ allow usernames?
-               -> Route Auth
+               => RegisterType
                -> HandlerT Auth (HandlerT master IO) TypedContent
-registerHelper allowUsername dest = do
+registerHelper regType = do
     y <- lift getYesod
     midentifier <- lookupPostParam "email"
     let eidentifier = case midentifier of
@@ -319,38 +404,32 @@ registerHelper allowUsername dest = do
             Just x
                 | Just x' <- Text.Email.Validate.canonicalizeEmail (encodeUtf8 x) ->
                     Right $ normalizeEmailAddress y $ decodeUtf8With lenientDecode x'
-                | allowUsername -> Right $ TS.strip x
+                | ForgotPassword <- regType -> Right $ TS.strip x
                 | otherwise -> Left Msg.InvalidEmailAddress
+        dest Register = registerR
+        dest ForgotPassword = forgotPasswordR
 
     case eidentifier of
-        Left route -> loginErrorMessageI dest route
+        Left eMsg -> loginErrorMessageI (dest regType) eMsg
         Right identifier -> do
-
             mecreds <- lift $ getEmailCreds identifier
-            registerCreds <-
-                case mecreds of
-                    Just (EmailCreds lid _ _ (Just key) email) -> return $ Just (lid, key, email)
-                    Just (EmailCreds lid _ _ Nothing email) -> do
+            case mecreds of
+                Just creds ->
+                    case regType of
+                        Register -> reRegister creds
+                        ForgotPassword -> forgotPassword creds identifier
+                Nothing
+                    | ForgotPassword <- regType ->
+                        loginErrorMessageI forgotPasswordR (Msg.IdentifierNotFound identifier)
+                    | otherwise -> do
                         key <- liftIO $ randomKey y
-                        lift $ setVerifyKey lid key
-                        return $ Just (lid, key, email)
-                    Nothing
-                        | allowUsername -> return Nothing
-                        | otherwise -> do
-                            key <- liftIO $ randomKey y
-                            lid <- lift $ addUnverified identifier key
-                            return $ Just (lid, key, identifier)
-
-            case registerCreds of
-                Nothing -> loginErrorMessageI dest (Msg.IdentifierNotFound identifier)
-                Just (lid, verKey, email) -> do
-                    render <- getUrlRender
-                    let verUrl = render $ verify (toPathPiece lid) verKey
-                    lift $ sendVerifyEmail email verKey verUrl
-                    lift $ confirmationEmailSentResponse identifier
+                        lid <- lift $ addUnverified identifier key
+                        let creds = EmailCreds lid Nothing False (Just key) identifier
+                        sendEmailHelper sendVerifyEmail
+                            confirmationEmailSentResponse creds identifier
 
 postRegisterR :: YesodAuthEmail master => HandlerT Auth (HandlerT master IO) TypedContent
-postRegisterR = registerHelper False registerR
+postRegisterR = registerHelper Register
 
 getForgotPasswordR :: YesodAuthEmail master => HandlerT Auth (HandlerT master IO) Html
 getForgotPasswordR = forgotPasswordHandler
@@ -374,7 +453,7 @@ defaultForgotPasswordHandler = do
         |]
 
 postForgotPasswordR :: YesodAuthEmail master => HandlerT Auth (HandlerT master IO) TypedContent
-postForgotPasswordR = registerHelper True forgotPasswordR
+postForgotPasswordR = registerHelper ForgotPassword
 
 getVerifyR :: YesodAuthEmail site
            => AuthEmailId site
